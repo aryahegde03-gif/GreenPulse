@@ -1,0 +1,336 @@
+# 🌱 GreenPulse — Carbon Intelligence Command Center
+## Complete Presentation Guide
+
+---
+
+## 1. What is GreenPulse?
+
+GreenPulse is a **Carbon Intelligence Command Center** — a data-driven dashboard that monitors server power consumption, calculates carbon emissions, detects anomalous energy behavior using **unsupervised machine learning**, and recommends **carbon-aware workload shifting** to reduce a data center's carbon footprint.
+
+### Problem Statement
+Data centers consume ~1-2% of global electricity. Most workloads run regardless of grid carbon intensity — during peak hours when the grid is dirtiest. There's no visibility into which servers behave abnormally or when it's "greenest" to run batch jobs.
+
+### Solution
+GreenPulse ingests server power data, computes carbon emissions, uses ML to flag anomalies, and simulates temporal workload shifting — showing exactly how much CO₂ can be saved by running flexible workloads during low-carbon windows.
+
+---
+
+## 2. Tech Stack
+
+| Layer | Technology | Purpose |
+|-------|-----------|---------|
+| **Frontend** | Streamlit | Interactive dashboard with dark theme |
+| **Visualization** | Plotly | Rich interactive charts (line, bar, heatmap, box, pie) |
+| **Backend/Data** | Python + Pandas | Data ingestion, cleaning, feature engineering |
+| **Database** | MongoDB | Stores raw data, anomalies, and shift results |
+| **ML - Anomaly** | Isolation Forest (scikit-learn) | Tree-based anomaly detection |
+| **ML - Clustering** | DBSCAN (scikit-learn) | Density-based noise detection |
+| **Config** | python-dotenv | Environment configuration |
+
+---
+
+## 3. Architecture & Data Flow
+
+```
+dataset.csv
+    │
+    ▼
+┌───────────────────────┐
+│  PIPELINE: Ingest     │  → Reads CSV
+│  (pipeline/ingest.py) │  → Calls clean_dataframe()
+│                       │  → Stores cleaned data in MongoDB
+└───────────┬───────────┘
+            │
+            ▼
+┌───────────────────────┐
+│  PIPELINE: Clean      │  → Normalizes column names
+│  (pipeline/clean.py)  │  → Drops invalid/null rows
+│                       │  → Calculates: energy_kwh, carbon_kg
+│                       │  → Adds: hour_of_day, day_of_week
+└───────────┬───────────┘
+            │
+            ▼
+┌───────────────────────┐
+│  ML: Anomaly Detection│  → Computes rolling features per server
+│  (features/anomaly.py)│  → Runs Isolation Forest + DBSCAN
+│                       │  → Flags anomalies (union of both models)
+│                       │  → Assigns severity: Critical/High/Medium
+│                       │  → Stores anomalies in MongoDB
+└───────────┬───────────┘
+            │
+            ▼
+┌───────────────────────┐
+│  Simulation: Shifting │  → Builds hourly carbon intensity profile
+│  (features/shifting.py│  → Identifies green (low) & red (peak) hours
+│                       │  → Classifies servers as flexible/inflexible
+│                       │  → Simulates shifting flexible workloads
+│                       │  → Calculates CO₂ savings per server
+│                       │  → Stores results in MongoDB
+└───────────┬───────────┘
+            │
+            ▼
+┌───────────────────────┐
+│  Dashboard (app.py)   │  → 4 pages with interactive Plotly charts
+│  + pages/             │  → Real-time state via Streamlit sessions
+│                       │  → Sidebar with stats & navigation
+└───────────────────────┘
+```
+
+---
+
+## 4. Dataset
+
+The input file `dataset.csv` contains **~25,920 rows** with 3 columns:
+
+| Column | Example | Description |
+|--------|---------|-------------|
+| `Timestamp` | `2025-11-01 0:00:00` | 5-minute interval readings |
+| `Server_ID` | `S1`, `S2`, `S3` | 3 servers being monitored |
+| `Power_Usage_Watts` | `78`, `163`, `112` | Power draw in Watts |
+
+- **Date range**: Nov 1–7, 2025 (7 days of data)
+- **Granularity**: every 5 minutes, 3 servers → 288 readings/day/server
+
+---
+
+## 5. Data Pipeline (How Data Gets Processed)
+
+### Step 1: Ingestion ([pipeline/ingest.py](file:///c:/Users/user/Downloads/greenpulse/greenpulse/pipeline/ingest.py))
+- Reads `dataset.csv` using Pandas
+- Passes data through the cleaning pipeline
+- **Deletes** old MongoDB records and **inserts** fresh cleaned records
+
+### Step 2: Cleaning ([pipeline/clean.py](file:///c:/Users/user/Downloads/greenpulse/greenpulse/pipeline/clean.py))
+This is where **feature engineering** happens:
+
+1. **Column normalization** — strips whitespace, converts to `Title_Case`
+2. **Timestamp parsing** — converts strings to datetime objects
+3. **Data validation** — drops rows with null/negative power or invalid timestamps
+4. **Deduplication** — removes duplicate `(Timestamp, Server_ID)` pairs
+5. **Derived columns calculated:**
+
+| Derived Column | Formula | Purpose |
+|---------------|---------|---------|
+| `hours_interval` | Time gap between consecutive readings per server | Time delta |
+| `energy_kwh` | `(Power_Watts × hours_interval) / 1000` | Energy consumed |
+| `carbon_kg` | `energy_kwh × 0.82` (emission factor) | **Carbon emissions** |
+| `hour_of_day` | Hour extracted from timestamp (0–23) | For hourly patterns |
+| `day_of_week` | Day extracted (0=Mon, 6=Sun) | For weekly patterns |
+
+> **Key formula**: `Carbon (kg CO₂) = Power (W) × Time (h) / 1000 × Emission Factor (0.82 kg CO₂/kWh)`
+> The emission factor 0.82 represents the average carbon intensity of the electricity grid.
+
+---
+
+## 6. Machine Learning: Anomaly Detection ([features/anomaly.py](file:///c:/Users/user/Downloads/greenpulse/greenpulse/features/anomaly.py))
+
+### What it detects
+Unusual power consumption patterns — spikes, drops, or erratic behavior that deviates from a server's normal baseline.
+
+### Features engineered (per server):
+
+| Feature | What it measures |
+|---------|-----------------|
+| `power_z_score` | How many standard deviations from the 1-hour rolling mean |
+| `power_delta` | Change in watts from the previous reading |
+| `energy_rate` | Energy consumption rate (kWh per hour) |
+| `rolling_std_power` | Volatility of power over the last hour (12 readings × 5min) |
+
+### Two ML Models Used (Unsupervised — no labels needed):
+
+#### Model 1: Isolation Forest
+- **Type**: Tree-based anomaly detector
+- **How it works**: Randomly partitions data. Anomalies are easier to isolate (need fewer splits), so they get shorter tree paths
+- **Parameters**: `n_estimators=100`, `contamination=0.02` (expects ~2% anomalies), `random_state=42`
+- **Output**: `-1` = anomaly, `1` = normal
+
+#### Model 2: DBSCAN (Density-Based Spatial Clustering)
+- **Type**: Density-based clustering
+- **How it works**: Groups nearby points into clusters. Points that don't belong to any dense cluster are labeled as **noise** (anomalies)
+- **Parameters**: `eps=0.3`, `min_samples=3`
+- **Preprocessing**: StandardScaler normalizes features before DBSCAN
+- **Output**: `-1` = noise/anomaly, `0+` = cluster label
+
+### Decision Logic
+```
+is_anomaly = (Isolation Forest says -1) OR (DBSCAN says -1)
+```
+Uses **union logic** — if EITHER model flags a point, it's an anomaly. This maximizes detection sensitivity.
+
+### Severity Classification
+Based on the anomaly's `severity` score = `|z_score| × (delta / rolling_mean)`:
+
+| Severity | Condition | Meaning |
+|----------|-----------|---------|
+| **Critical** | severity > 2 | Extreme deviation, needs immediate attention |
+| **High** | severity > 1 | Significant deviation |
+| **Medium** | any other anomaly | Notable but moderate deviation |
+
+---
+
+## 7. Carbon-Aware Workload Shifting ([features/shifting.py](file:///c:/Users/user/Downloads/greenpulse/greenpulse/features/shifting.py))
+
+This is the **sustainability simulation** — the core innovation of GreenPulse.
+
+### Concept
+Not all hours of the day have equal carbon intensity. If we can **defer flexible workloads** (like batch processing, backups, ML training) from peak carbon hours to low carbon hours, we reduce emissions without impacting user-facing services.
+
+### How it works (step by step):
+
+#### Step 1: Build Hourly Carbon Intensity Profile
+- Averages power usage across all servers per hour of day
+- Normalizes to a `0.6 – 1.0` intensity scale
+- Higher fleet power → higher carbon intensity (more demand on the grid)
+
+#### Step 2: Identify Green & Red Windows
+- **Green hours** (bottom 25th percentile intensity) → best time to run workloads
+- **Red hours** (top 75th percentile intensity) → worst time, should defer if possible
+
+#### Step 3: Classify Server Flexibility
+For each server, calculates:
+- **Coefficient of Variation (CV)** = `std / mean` of power
+- **Red Peak Ratio** = what fraction of peak power occurs during red hours
+
+| Classification | Condition | Meaning |
+|---------------|-----------|---------|
+| **Flexible** | CV < 0.2 AND peak in red hours > 50% | Steady workload that peaks during bad times — can be shifted |
+| **Inflexible** | Otherwise | Interactive/variable workload — don't shift |
+
+#### Step 4: Simulate the Shift
+For flexible servers during red hours:
+```
+shifted_carbon = energy_kwh × average_green_intensity
+```
+Instead of emitting at the red-hour intensity, we pretend the work ran at green-hour intensity.
+
+#### Step 5: Calculate Savings
+```
+carbon_saved = actual_carbon - shifted_carbon
+savings_percentage = (saved / actual) × 100%
+```
+
+---
+
+## 8. Dashboard Pages (What You'll Demo)
+
+### Page 1: 🏠 Dashboard (Fleet Overview)
+**What it shows**: Bird's-eye view of the entire server fleet
+
+| Widget | What it displays |
+|--------|-----------------|
+| **Metric cards** | Total carbon emitted, anomalies detected, carbon saved, savings % |
+| **Line chart** | Carbon emissions over time per server |
+| **Box plot** | Power distribution comparison across servers |
+| **Heatmap** | Hourly carbon intensity by day of week (shows patterns) |
+| **Donut chart** | Energy consumption share per server |
+| **Table** | 20 most recent readings |
+
+### Page 2: 🔍 Anomaly Detection
+**What it shows**: All detected anomalies with ML insights
+
+| Widget | What it displays |
+|--------|-----------------|
+| **Severity metrics** | Count of Critical / High / Medium anomalies |
+| **Bar chart** | Severity breakdown |
+| **Horizontal bar** | Anomalies per server |
+| **Scatter timeline** | Normal points (grey) + anomalies (colored by severity) with range slider |
+| **Expandable section** | Explains how the ML models work |
+| **Data table** | Full anomaly details with download button |
+
+### Page 3: ⚡ Workload Shifting
+**What it shows**: The carbon-aware shifting simulation results
+
+| Widget | What it displays |
+|--------|-----------------|
+| **Metric cards** | Actual vs shifted carbon, savings |
+| **Area chart** | 24-hour carbon intensity profile with green/red zones |
+| **Status boxes** | Green hours vs Red hours |
+| **Server cards** | Which servers are flexible vs inflexible |
+| **Grouped bar** | Actual vs shifted carbon per server |
+| **Recommendation cards** | Per-server actionable advice |
+
+### Page 4: 📊 Server Details
+**What it shows**: Deep-dive into a single server
+
+| Widget | What it displays |
+|--------|-----------------|
+| **Dropdown** | Select any server |
+| **Metrics** | Records, energy, carbon, avg power, anomaly count for that server |
+| **Timeline** | Power usage line + rolling average + anomaly markers |
+| **Histogram** | Power distribution with normal curve overlay |
+| **Box plot** | This server vs rest of fleet comparison |
+| **Hourly pattern** | This server's hourly avg vs fleet average |
+| **Anomaly table** | Server-specific anomalies with download |
+| **Recommendation** | Server-specific shifting advice |
+
+---
+
+## 9. Database Schema (MongoDB)
+
+| Collection | Contents | # of Records |
+|-----------|----------|------------|
+| `server_emissions` | Cleaned raw data with derived columns | ~25,920 |
+| `anomalies` | Only flagged anomaly records with severity, context | Varies (~500-1500) |
+| `shift_recommendations` | Single document: fleet summary + per-server results | 1 document |
+
+---
+
+## 10. Key Talking Points for Your Presentation
+
+### 🎯 Problem
+> "Data centers are responsible for ~1-2% of global electricity consumption. Most workloads run blind to carbon intensity — during peak pollution hours."
+
+### 💡 Solution
+> "GreenPulse is a Carbon Intelligence Command Center that ingests server power data, calculates real-time carbon emissions, uses unsupervised ML to detect anomalies, and simulates carbon-aware scheduling to reduce emissions."
+
+### 🤖 ML Approach
+> "We use two complementary unsupervised models — Isolation Forest (tree-based) and DBSCAN (density-based) — running per-server on engineered features. Using union logic ensures we catch anomalies that either model detects."
+
+### 🌍 Impact
+> "Our workload shifting simulation shows exactly how much CO₂ can be saved by deferring flexible batch workloads from peak hours to green windows — with specific, actionable recommendations per server."
+
+### 🏗 Architecture
+> "Built with Python, Streamlit, MongoDB, and scikit-learn. The pipeline is modular: ingest → clean → detect → simulate → visualize. All results persist in MongoDB for fast retrieval."
+
+---
+
+## 11. Potential Questions & Answers
+
+**Q: Why MongoDB and not SQL?**
+> A: The data has nested structures (shift results contain per-server arrays). MongoDB's document model handles this naturally without complex joins. Also, MongoDB scales horizontally for real-world IoT data volumes.
+
+**Q: Why two anomaly detection models instead of one?**
+> A: Isolation Forest and DBSCAN detect different types of anomalies. IF is good at finding isolated outliers (global anomalies), while DBSCAN excels at finding points in sparse regions (local anomalies). Using both gives broader coverage.
+
+**Q: What is the emission factor 0.82?**
+> A: It represents 0.82 kg CO₂ per kWh — a realistic average grid carbon intensity. In production, this would come from a real-time carbon intensity API (like WattTime or Electricity Maps).
+
+**Q: Is the workload shifting actually moving workloads?**
+> A: No, it's a **simulation**. It calculates hypothetical savings if flexible workloads were rescheduled. In production, this would integrate with a job scheduler (like Kubernetes CronJobs) to actually defer batch work.
+
+**Q: How are "flexible" servers identified?**
+> A: Using Coefficient of Variation (CV < 0.2 means steady power, likely batch workloads) and whether their peak usage falls during red hours. Interactive servers have high variability, so they're marked inflexible.
+
+**Q: What does the z-score feature represent?**
+> A: It measures how many standard deviations a reading is from the server's 1-hour rolling average. A z-score of 3 means the reading is 3 standard deviations away — very unusual.
+
+---
+
+## 12. How to Run (Demo Commands)
+
+```powershell
+# 1. Start MongoDB (needs admin PowerShell)
+net start MongoDB
+
+# 2. Install dependencies
+pip install -r requirements.txt
+
+# 3. Run the app (from the outer greenpulse folder)
+streamlit run greenpulse\app.py
+```
+
+The app opens at **http://localhost:8501** automatically.
+
+---
+
+> **Good luck with your presentation tomorrow! 🍀**
